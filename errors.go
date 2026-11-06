@@ -132,12 +132,15 @@ func (e Error) Unwrap() []error {
 // AsMap returns a full map representation of the error, including the parsed
 // message, all additional data (safe and unsafe), and recursively embedded
 // original errors. Do NOT send this to external telemetry if PII may be present.
+//
+// The reserved keys "message", "stackTrace", "originalError", and
+// "originalErrors" are always set by the error itself; data supplied through
+// [WithSafeData] or [WithAdditionalData] cannot shadow them.
 func (e Error) AsMap() map[string]any {
-	temporaryMap := map[string]any{
-		"message": e.parsedMessage,
-	}
+	temporaryMap := map[string]any{}
 	maps.Copy(temporaryMap, e.safeData)
 	maps.Copy(temporaryMap, e.additionalData)
+	temporaryMap["message"] = e.parsedMessage
 
 	if len(e.stack) > 0 {
 		temporaryMap["stackTrace"] = e.StackTrace()
@@ -171,16 +174,19 @@ func (e Error) AsMap() map[string]any {
 // If [WithSafeParsedMessage] was provided, the "message" field contains the
 // safe-formatted message. Otherwise, printf verbs are stripped to produce a
 // clean, human-readable string (e.g., "user %s not found" becomes "user not found").
+//
+// The reserved keys "message", "stackTrace", "originalError", and
+// "originalErrors" are always set by the error itself; data supplied through
+// [WithSafeData] cannot shadow them.
 func (e Error) SafeMap() map[string]any {
 	e.parse()
 	msg := sanitizeTemplate(e.message)
 	if e.safeMessage != "" {
 		msg = e.safeMessage
 	}
-	safeMap := map[string]any{
-		"message": msg,
-	}
+	safeMap := map[string]any{}
 	maps.Copy(safeMap, e.safeData)
+	safeMap["message"] = msg
 
 	if len(e.stack) > 0 {
 		safeMap["stackTrace"] = e.StackTrace()

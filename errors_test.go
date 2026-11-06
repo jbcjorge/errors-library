@@ -350,3 +350,35 @@ func TestSafeParsedMessage_FewerArgs(t *testing.T) {
 	// SafeMessage is empty (validation failed), falls back to stripped
 	assert.Equal(t, "error in at", err.SafeError())
 }
+
+func TestSafeMap_DataCannotShadowMessage(t *testing.T) {
+	err := New("real message",
+		WithSafeData(map[string]any{"message": "impostor"}),
+	)
+	assert.Equal(t, "real message", err.SafeMap()["message"])
+}
+
+func TestAsMap_DataCannotShadowMessage(t *testing.T) {
+	err := New("real message",
+		WithSafeData(map[string]any{"message": "safe impostor"}),
+		WithAdditionalData(map[string]any{"message": "unsafe impostor"}),
+	)
+	assert.Equal(t, "real message", err.AsMap()["message"])
+}
+
+func TestSafeMap_DataCannotShadowReservedKeys(t *testing.T) {
+	inner := New("inner")
+	err := New("outer",
+		WithError(inner),
+		WithSafeData(map[string]any{
+			"stackTrace":    "fake",
+			"originalError": "fake",
+		}),
+	)
+	safe := err.SafeMap()
+	// Reserved keys reflect the real error, not the injected data.
+	_, stackIsString := safe["stackTrace"].(string)
+	assert.False(t, stackIsString)
+	_, origIsMap := safe["originalError"].(map[string]any)
+	assert.True(t, origIsMap)
+}
