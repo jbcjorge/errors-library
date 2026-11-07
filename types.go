@@ -9,9 +9,10 @@ type StoredError struct {
 	name      ErrorType
 }
 
-// ErrorType identifies the kind of option stored in an [Error].
-// Each type can appear at most once; adding a second option of the same type
-// overwrites the first.
+// ErrorType identifies the kind of option stored in an [Error]. Late-parsed
+// options are stored by type, so adding a second late-parsed option of the same
+// type overwrites the first. Immediate options (wrapped errors, data)
+// are applied when added: wrapped errors are appended and data is merged.
 type ErrorType string
 
 // Error is the central structured error type. It holds a message template,

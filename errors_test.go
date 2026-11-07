@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -123,6 +124,13 @@ func TestMarshalJSON(t *testing.T) {
 	assert.Contains(t, string(jsonBytes), "404")
 }
 
+func TestMarshalJSON_FormatsLateParsedMessage(t *testing.T) {
+	err := New("user %s", WithParsedMessage("bob"))
+	raw, marshalErr := err.MarshalJSON()
+	assert.NoError(t, marshalErr)
+	assert.Contains(t, string(raw), `"message":"user bob"`)
+}
+
 func TestLateParse(t *testing.T) {
 	stored := LateParse("test", func(e *Error) {
 		e.parsedMessage = "late parsed"
@@ -165,7 +173,8 @@ func TestAs_DirectMatch(t *testing.T) {
 
 func TestAs_ThroughUnwrapChain(t *testing.T) {
 	inner := New("inner error", WithAdditionalData(map[string]any{"code": 500}))
-	outer := fmt.Errorf("outer: %w", inner)
+	var innerErr error = inner
+	outer := fmt.Errorf("outer: %w", innerErr)
 
 	var target *Error
 	assert.True(t, As(outer, &target))
@@ -381,4 +390,416 @@ func TestSafeMap_DataCannotShadowReservedKeys(t *testing.T) {
 	assert.False(t, stackIsString)
 	_, origIsMap := safe["originalError"].(map[string]any)
 	assert.True(t, origIsMap)
+}
+
+// --- AsMap / MarshalJSON format late-parsed messages ---
+
+func TestAsMap_FormatsLateParsedMessage(t *testing.T) {
+	err := New("user %s", WithParsedMessage("bob"))
+	assert.Equal(t, "user bob", err.AsMap()["message"])
+}
+
+// --- sentinel immutability, field by field ---
+
+func TestParse_DoesNotMutateSentinelData(t *testing.T) {
+	sentinel := New("sentinel %s",
+		WithSafeData(map[string]any{"s": 1}),
+		WithAdditionalData(map[string]any{"a": 1}),
+		WithError(nerrors.New("cause")),
+	)
+
+	_ = sentinel.Parse(
+		WithSafeData(map[string]any{"leak": "x"}),
+		WithAdditionalData(map[string]any{"leak": "x"}),
+		WithError(nerrors.New("extra")),
+		WithParsedMessage("v"),
+	)
+
+	assert.NotContains(t, sentinel.SafeMap(), "leak")
+	assert.NotContains(t, sentinel.AsMap(), "leak")
+	assert.Len(t, sentinel.Originals(), 1)
+	assert.Equal(t, "sentinel %s", sentinel.Error())
+}
+
+func TestParse_ClonesDoNotShareOriginalsStorage(t *testing.T) {
+	// Three single appends leave spare capacity in the backing array, which a
+	// shared slice would let two clones overwrite.
+	sentinel := New("sentinel",
+		WithError(nerrors.New("a")),
+		WithError(nerrors.New("b")),
+		WithError(nerrors.New("c")),
+	)
+	first := nerrors.New("first")
+	second := nerrors.New("second")
+
+	p1 := sentinel.Parse(WithError(first)).(*Error)
+	p2 := sentinel.Parse(WithError(second)).(*Error)
+
+	assert.Same(t, first, p1.Originals()[3])
+	assert.Same(t, second, p2.Originals()[3])
+}
+
+func newStackSentinel() *Error { return New("stack sentinel") }
+
+func TestParse_RecapturesStackAtCallSite(t *testing.T) {
+	sentinel := newStackSentinel()
+	parsed := sentinel.Parse().(*Error)
+
+	assert.Contains(t, sentinel.StackTrace()[0], "newStackSentinel")
+	assert.Contains(t, parsed.StackTrace()[0], "TestParse_RecapturesStackAtCallSite")
+}
+
+// --- reserved keys ---
+
+func TestSafeMap_ReservedKeysCannotBeFaked(t *testing.T) {
+	// No cause was wrapped, so the error must not claim one.
+	err := New("plain", WithSafeData(map[string]any{
+		"originalError":  "fake",
+		"originalErrors": "fake",
+	}))
+	safe := err.SafeMap()
+	assert.NotContains(t, safe, "originalError")
+	assert.NotContains(t, safe, "originalErrors")
+}
+
+func TestAsMap_ReservedKeysCannotBeOverwrittenByData(t *testing.T) {
+	err := New("outer",
+		WithError(New("inner")),
+		WithSafeData(map[string]any{"message": "fake", "stackTrace": "fake"}),
+		WithAdditionalData(map[string]any{"originalError": "fake", "stackTrace": "fake"}),
+	)
+	m := err.AsMap()
+	assert.Equal(t, "outer", m["message"])
+	_, stackIsList := m["stackTrace"].([]string)
+	assert.True(t, stackIsList)
+	_, causeIsMap := m["originalError"].(map[string]any)
+	assert.True(t, causeIsMap)
+}
+
+// --- SafeMap never emits text of wrapped errors that are not library errors ---
+
+func TestSafeMap_OmitsForeignOriginalError(t *testing.T) {
+	err := New("lookup failed", WithError(nerrors.New("dial tcp 10.0.0.5:5432: password=hunter2")))
+	safe := err.SafeMap()
+	assert.NotContains(t, safe, "originalError")
+	assert.NotContains(t, fmt.Sprint(safe), "hunter2")
+}
+
+func TestSafeMap_OmitsForeignOriginalErrors(t *testing.T) {
+	err := New("batch failed", WithErrors(nerrors.New("ssn 123-45-6789"), nerrors.New("token=abc")))
+	safe := err.SafeMap()
+	assert.NotContains(t, safe, "originalErrors")
+	assert.NotContains(t, fmt.Sprint(safe), "123-45-6789")
+}
+
+func TestSafeMap_KeepsOnlyNativeCausesInMixedList(t *testing.T) {
+	native := New("native cause", WithSafeData(map[string]any{"code": "N1"}))
+	err := New("batch failed", WithErrors(nerrors.New("secret"), native, nerrors.New("other secret")))
+
+	causes, ok := err.SafeMap()["originalErrors"].([]any)
+	assert.True(t, ok)
+	assert.Len(t, causes, 1)
+	assert.Equal(t, "N1", causes[0].(map[string]any)["code"])
+	assert.NotContains(t, fmt.Sprint(err.SafeMap()), "secret")
+}
+
+func TestSafeMap_ForeignWrapperAroundNativeUsesNativeSafeView(t *testing.T) {
+	native := New("native cause", WithSafeData(map[string]any{"code": "N1"}))
+	var nativeErr error = native
+	err := New("outer", WithError(fmt.Errorf("secret context: %w", nativeErr)))
+
+	cause, ok := err.SafeMap()["originalError"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "N1", cause["code"])
+	assert.NotContains(t, fmt.Sprint(err.SafeMap()), "secret context")
+}
+
+func TestAsMap_KeepsForeignOriginalText(t *testing.T) {
+	// The internal view still shows everything, for logs.
+	err := New("lookup failed", WithError(nerrors.New("dial tcp: refused")))
+	assert.Equal(t, "dial tcp: refused", err.AsMap()["originalError"])
+}
+
+func TestAsMap_SingleVersusMultipleOriginals(t *testing.T) {
+	// Exactly one original: singular key.
+	single := New("outer", WithError(nerrors.New("only")))
+	assert.Equal(t, "only", single.AsMap()["originalError"])
+	assert.NotContains(t, single.AsMap(), "originalErrors")
+
+	// More than one: plural key, singular absent. This pins the len > 1 boundary.
+	multi := New("outer", WithErrors(nerrors.New("a"), nerrors.New("b")))
+	errs, ok := multi.AsMap()["originalErrors"].([]any)
+	assert.True(t, ok)
+	assert.Len(t, errs, 2)
+	assert.NotContains(t, multi.AsMap(), "originalError")
+}
+
+func TestSafeMap_SingleNativeCauseUsesSingularKey(t *testing.T) {
+	err := New("outer", WithError(New("the one cause", WithSafeData(map[string]any{"c": "1"}))))
+	safe := err.SafeMap()
+	cause, ok := safe["originalError"].(map[string]any)
+	assert.True(t, ok, "exactly one native cause must use the singular key")
+	assert.Equal(t, "1", cause["c"])
+	assert.NotContains(t, safe, "originalErrors")
+}
+
+func TestSafeMap_TwoNativeCausesUsePluralKey(t *testing.T) {
+	err := New("outer",
+		WithErrors(
+			New("first", WithSafeData(map[string]any{"c": "1"})),
+			New("second", WithSafeData(map[string]any{"c": "2"})),
+		),
+	)
+	safe := err.SafeMap()
+	causes, ok := safe["originalErrors"].([]any)
+	assert.True(t, ok, "more than one native cause must use the plural key")
+	assert.Len(t, causes, 2)
+	assert.NotContains(t, safe, "originalError")
+}
+
+func TestSafeMap_SingleForeignCauseHasNoOriginalKey(t *testing.T) {
+	// One original, but foreign: the singular branch must not fire.
+	err := New("outer", WithError(nerrors.New("foreign")))
+	safe := err.SafeMap()
+	assert.NotContains(t, safe, "originalError")
+	assert.NotContains(t, safe, "originalErrors")
+}
+
+func TestSafeMap_StackPresentVersusAbsent(t *testing.T) {
+	withStack := New("has a stack")
+	_, present := withStack.SafeMap()["stackTrace"]
+	assert.True(t, present)
+
+	// A zero-value Error has no captured stack: the len(stack) > 0 guard must hold.
+	noStack := Error{message: "none", parsedMessage: "none", options: map[ErrorType]ErrorOption{}}
+	_, absent := noStack.SafeMap()["stackTrace"]
+	assert.False(t, absent)
+}
+
+// --- nil causes and stackless errors ---
+
+func TestWithError_NilIsIgnored(t *testing.T) {
+	err := New("x", WithError(nil))
+	assert.Empty(t, err.Originals())
+	assert.NotPanics(t, func() { err.SafeMap(); err.AsMap() })
+}
+
+func TestWithErrors_NilsAreIgnored(t *testing.T) {
+	real := nerrors.New("real")
+	err := New("x", WithErrors(nil, real, nil))
+	assert.Equal(t, []error{real}, err.Originals())
+	assert.NotPanics(t, func() { err.SafeMap(); err.AsMap() })
+}
+
+func TestStackTrace_NilWhenNoStackWasCaptured(t *testing.T) {
+	assert.Nil(t, Error{}.StackTrace())
+}
+
+// --- message templates ---
+
+func TestSafeError_EscapedPercentBecomesLiteral(t *testing.T) {
+	err := New("quota %s at 100%% used", WithParsedMessage("user-1"))
+	assert.Equal(t, "quota user-1 at 100% used", err.Error())
+	assert.Equal(t, "quota at 100% used", err.SafeError())
+}
+
+func TestWithParsedMessage_ArgumentTextLookingLikeAFormatErrorIsKept(t *testing.T) {
+	err := New("name: %s", WithParsedMessage("a%!b(c)"))
+	assert.Equal(t, "name: a%!b(c)", err.Error())
+}
+
+func TestWithSafeParsedMessage_ArgumentTextLookingLikeAFormatErrorIsKept(t *testing.T) {
+	err := New("name: %s", WithSafeParsedMessage("a%!b(c)"))
+	assert.Equal(t, "name: a%!b(c)", err.SafeError())
+}
+
+func TestWithParsedMessage_MalformedFormattingKeepsTemplate(t *testing.T) {
+	assert.Equal(t, "n=%d", New("n=%d", WithParsedMessage("not a number")).Error()) // wrong verb
+	assert.Equal(t, "n=%d", New("n=%d", WithParsedMessage()).Error())               // missing
+	assert.Equal(t, "x", New("x", WithParsedMessage("extra")).Error())              // extra
+}
+
+// --- stdlib re-exports ---
+
+func TestAsMap_ReservedKeysCannotBeFakedWhenAbsent(t *testing.T) {
+	// No cause and no stack: the error must not claim either through data.
+	err := &Error{
+		message:        "bare",
+		parsedMessage:  "bare",
+		additionalData: map[string]any{"originalError": "fake", "originalErrors": "fake", "stackTrace": "fake"},
+		safeData:       map[string]any{},
+		options:        map[ErrorType]ErrorOption{},
+	}
+	m := err.AsMap()
+	assert.NotContains(t, m, "originalError")
+	assert.NotContains(t, m, "originalErrors")
+	assert.NotContains(t, m, "stackTrace")
+}
+
+// --- cyclic and deep error graphs ---
+
+func TestSafeMap_CyclicGraphDoesNotOverflow(t *testing.T) {
+	a := New("a")
+	b := New("b", WithError(a))
+	a.AddOptions(WithError(b)) // a -> b -> a
+
+	assert.NotPanics(t, func() {
+		safe := a.SafeMap()
+		assert.Equal(t, "a", safe["message"])
+	})
+}
+
+func TestAsMap_CyclicGraphDoesNotOverflow(t *testing.T) {
+	a := New("a")
+	b := New("b", WithError(a))
+	a.AddOptions(WithError(b))
+
+	assert.NotPanics(t, func() {
+		assert.Equal(t, "a", a.AsMap()["message"])
+	})
+}
+
+func TestSafeMap_SelfWrappingErrorDoesNotOverflow(t *testing.T) {
+	self := New("self")
+	self.AddOptions(WithError(self))
+
+	assert.NotPanics(t, func() { self.SafeMap(); self.AsMap() })
+}
+
+// chainDepth counts the nested "originalError" levels of a map.
+func chainDepth(m map[string]any) int {
+	depth := 0
+	for {
+		next, ok := m["originalError"].(map[string]any)
+		if !ok {
+			return depth
+		}
+		depth++
+		m = next
+	}
+}
+
+func TestSafeMap_RealisticChainIsFullyReported(t *testing.T) {
+	// A chain well under the bound must not be truncated.
+	var err error = New("level 0")
+	for i := 1; i <= 20; i++ {
+		err = New(fmt.Sprintf("level %d", i), WithError(err))
+	}
+	top := err.(*Error)
+
+	assert.Equal(t, 20, chainDepth(top.SafeMap()))
+	assert.Equal(t, 20, chainDepth(top.AsMap()))
+}
+
+func TestSafeMap_ChainBeyondTheBoundIsTruncated(t *testing.T) {
+	var err error = New("level 0")
+	for i := 1; i <= maxMapDepth+10; i++ {
+		err = New(fmt.Sprintf("level %d", i), WithError(err))
+	}
+	top := err.(*Error)
+
+	assert.Equal(t, maxMapDepth, chainDepth(top.SafeMap()))
+	assert.Equal(t, maxMapDepth, chainDepth(top.AsMap()))
+}
+
+// --- branching cycles need a total budget, not only a depth bound ---
+
+// mapWithin fails the test instead of hanging when the map call does not return.
+func mapWithin(t *testing.T, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); fn() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("map call did not return: the visit budget is not working")
+	}
+}
+
+func TestSafeMap_BranchingSelfCycleTerminates(t *testing.T) {
+	self := New("self")
+	self.AddOptions(WithErrors(self, self)) // two causes, both itself: 2^64 paths
+
+	mapWithin(t, func() { assert.Equal(t, "self", self.SafeMap()["message"]) })
+}
+
+func TestAsMap_BranchingSelfCycleTerminates(t *testing.T) {
+	self := New("self")
+	self.AddOptions(WithErrors(self, self))
+
+	mapWithin(t, func() { assert.Equal(t, "self", self.AsMap()["message"]) })
+}
+
+func TestAsMap_MultiCauseCycleTerminates(t *testing.T) {
+	a := New("a")
+	b := New("b", WithErrors(a, nerrors.New("foreign")))
+	a.AddOptions(WithErrors(b, nerrors.New("foreign")))
+
+	mapWithin(t, func() { assert.Equal(t, "a", a.AsMap()["message"]) })
+}
+
+func TestAsMap_MultiCauseRendersNativeAsMapAndForeignAsText(t *testing.T) {
+	native := New("native cause", WithSafeData(map[string]any{"code": "N1"}))
+	err := New("outer", WithErrors(native, nerrors.New("foreign cause")))
+
+	causes, ok := err.AsMap()["originalErrors"].([]any)
+	assert.True(t, ok)
+	assert.Len(t, causes, 2)
+
+	nativeMap, isMap := causes[0].(map[string]any)
+	assert.True(t, isMap, "a native cause must be rendered as its map")
+	assert.Equal(t, "native cause", nativeMap["message"])
+	assert.Equal(t, "N1", nativeMap["code"])
+	assert.Equal(t, "foreign cause", causes[1], "a foreign cause is rendered as text in the internal view")
+}
+
+func TestSafeMap_WideTreeUnderTheBudgetIsFullyReported(t *testing.T) {
+	causes := make([]error, 50)
+	for i := range causes {
+		causes[i] = New(fmt.Sprintf("cause %d", i))
+	}
+	err := New("outer", WithErrors(causes...))
+
+	reported, ok := err.SafeMap()["originalErrors"].([]any)
+	assert.True(t, ok)
+	assert.Len(t, reported, 50)
+}
+
+// multiChainDepth counts the nested levels reached through the first entry of
+// "originalErrors", the multi-cause shape.
+func multiChainDepth(m map[string]any) int {
+	depth := 0
+	for {
+		causes, ok := m["originalErrors"].([]any)
+		if !ok || len(causes) == 0 {
+			return depth
+		}
+		next, isMap := causes[0].(map[string]any)
+		if !isMap {
+			return depth
+		}
+		depth++
+		m = next
+	}
+}
+
+func TestAsMap_MultiCauseChainIsTruncatedAtTheDepthBound(t *testing.T) {
+	// No cycle here, so only the depth bound (not the node budget) can stop it.
+	var err error = New("level 0")
+	for i := 1; i <= maxMapDepth+10; i++ {
+		err = New(fmt.Sprintf("level %d", i), WithErrors(err, nerrors.New("sibling")))
+	}
+	top := err.(*Error)
+
+	assert.Equal(t, maxMapDepth, multiChainDepth(top.AsMap()))
+}
+
+func TestSafeMap_MultiCauseChainIsTruncatedAtTheDepthBound(t *testing.T) {
+	var err error = New("level 0")
+	for i := 1; i <= maxMapDepth+10; i++ {
+		err = New(fmt.Sprintf("level %d", i), WithErrors(err, New("sibling")))
+	}
+	top := err.(*Error)
+
+	assert.Equal(t, maxMapDepth, multiChainDepth(top.SafeMap()))
 }
