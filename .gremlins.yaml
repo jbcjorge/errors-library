@@ -1,0 +1,23 @@
+# Gremlins mutation testing configuration.
+# Docs: https://gremlins.dev
+#
+# Gremlins runs the package tests (plain `go test`, not the -race build used by
+# `make test`) once per mutant, so it stays fast. The quality gate below fails
+# the run when the suite gets weaker.
+#
+# The thresholds sit a few points under the current result (efficacy ~88%,
+# coverage ~89%) rather than at 100%. Two reasons: a residual set of equivalent
+# mutants cannot be killed by any test (map capacity hints such as
+# make(map, len+1), the "-1" (find all) argument to a regexp match, and some
+# boundary flips on len() checks that do not change observable behavior), and
+# the per-mutant timing wobbles a few points run to run. The gate exists to
+# catch a real regression, not to sit on the edge.
+silent: false
+unleash:
+  # Each mutant's test run is allowed this multiple of the clean run's duration
+  # before it counts as timed out. The clean suite is fast, so a generous
+  # coefficient avoids false timeouts on slower CI runners.
+  timeout-coefficient: 15
+  threshold:
+    efficacy: 80
+    mutant-coverage: 80
