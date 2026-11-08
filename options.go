@@ -128,3 +128,57 @@ func WithSafeData(data map[string]any) StoredError {
 			maps.Copy(e.safeData, data)
 		})
 }
+
+// WithJSONOutputAsUnsafe makes [Error.MarshalJSON] encode the internal view
+// ([Error.AsMap]) instead of the safe one. The internal view includes
+// additional data, interpolated arguments, and the text of wrapped errors, and
+// may contain PII.
+//
+// Safe output is the default; this is the explicit opt-out, for errors whose
+// JSON goes only to internal sinks. To limit the opt-out to one occurrence,
+// pass it to [Error.Parse] instead of New: Parse returns a fresh error, so a
+// sentinel keeps its safe default.
+//
+// It has no effect on [Error.SafeMap], [Error.SafeError], or the httperr
+// subpackage, which always use the safe view.
+func WithJSONOutputAsUnsafe() StoredError {
+	return ImmediateParse(
+		TypeErrUnsafeJSON,
+		func(e *Error) {
+			e.unsafeJSON = true
+		})
+}
+
+// WithGeneralOutputAsUnsafe makes every implicit output of the error use the
+// internal view ([Error.AsMap]) instead of the safe one. An implicit output is
+// one the caller does not ask for by name; today that is [Error.MarshalJSON],
+// and outputs added later will respect this option as well.
+//
+// It is a superset of [WithJSONOutputAsUnsafe]. The same rules apply: safe is
+// the default, this is an explicit opt-out for internal sinks, it can be scoped
+// to one occurrence by passing it to [Error.Parse], and it has no effect on
+// [Error.SafeMap], [Error.SafeError], or the httperr subpackage.
+func WithGeneralOutputAsUnsafe() StoredError {
+	return ImmediateParse(
+		TypeErrUnsafeOutput,
+		func(e *Error) {
+			e.unsafeOutput = true
+		})
+}
+
+// WithHTTPStatus associates an HTTP status code with the error. The code is
+// stored as structured metadata (it does not affect the rendered message) and
+// can be read back via [Error.HTTPStatus]. The companion httperr subpackage
+// resolves the status across an error chain. This is typically set at sentinel
+// declaration time, since the status is an invariant property of the error
+// kind:
+//
+//	var ErrNotAuthorized = errors.New("not authorized",
+//		errors.WithHTTPStatus(http.StatusForbidden))
+func WithHTTPStatus(code int) StoredError {
+	return ImmediateParse(
+		TypeErrHTTPStatus,
+		func(e *Error) {
+			e.httpStatus = code
+		})
+}

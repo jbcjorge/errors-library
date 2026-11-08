@@ -11,7 +11,7 @@ type StoredError struct {
 
 // ErrorType identifies the kind of option stored in an [Error]. Late-parsed
 // options are stored by type, so adding a second late-parsed option of the same
-// type overwrites the first. Immediate options (wrapped errors, data)
+// type overwrites the first. Immediate options (wrapped errors, data, status)
 // are applied when added: wrapped errors are appended and data is merged.
 type ErrorType string
 
@@ -27,6 +27,12 @@ type Error struct {
 	safeData       map[string]any
 	options        map[ErrorType]ErrorOption
 	stack          []uintptr
+	httpStatus     int
+	// unsafeJSON and unsafeOutput switch the implicit outputs (today only
+	// MarshalJSON) from the safe view to the internal view. Both are off by
+	// default: safe output is the default, the unsafe one is an explicit choice.
+	unsafeJSON   bool
+	unsafeOutput bool
 }
 
 // ErrorOption is a function that mutates an [Error] to apply additional

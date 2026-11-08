@@ -14,7 +14,16 @@ import (
 // provided options. The message may contain printf-style verbs that are filled
 // in later via [WithParsedMessage]. A literal percent sign must be written as
 // "%%".
+//
+// New panics if message is empty or whitespace only. An error without a
+// message is a programming mistake, and since sentinels are declared at
+// package level, the panic surfaces at program startup rather than at the
+// moment the error is returned. Do not build the message from runtime data
+// that may be empty (for example New(err.Error())).
 func New(message string, opts ...StoredError) *Error {
+	if strings.TrimSpace(message) == "" {
+		panic("errors: New called with an empty message")
+	}
 	err := &Error{
 		message:        message,
 		parsedMessage:  message,
@@ -86,6 +95,9 @@ func (e *Error) clone() *Error {
 		safeData:       newSafe,
 		options:        newOpts,
 		stack:          e.stack,
+		httpStatus:     e.httpStatus,
+		unsafeJSON:     e.unsafeJSON,
+		unsafeOutput:   e.unsafeOutput,
 	}
 }
 
@@ -122,6 +134,13 @@ func (e Error) Original() error {
 // Originals returns all wrapped original errors.
 func (e Error) Originals() []error {
 	return e.originals
+}
+
+// HTTPStatus returns the HTTP status code associated with the error via
+// [WithHTTPStatus], or 0 if none was set. It does not search wrapped errors;
+// the httperr subpackage resolves a status across an error chain.
+func (e Error) HTTPStatus() int {
+	return e.httpStatus
 }
 
 // Is implements the interface used by [errors.Is]. Two Errors are considered
@@ -329,8 +348,19 @@ var (
 	multiSpace   = regexp.MustCompile(`\s{2,}`)
 )
 
-// MarshalJSON implements [encoding/json.Marshaler] by marshalling the map
-// representation returned by [Error.AsMap].
+// MarshalJSON implements [encoding/json.Marshaler]. It is safe by default: it
+// encodes the telemetry-safe view returned by [Error.SafeMap], so encoding an
+// error with encoding/json, or logging it with a structured logger that honors
+// json.Marshaler (such as the JSON handler of log/slog), never exposes
+// additional data, interpolated arguments, or the text of wrapped errors that
+// are not library errors.
+//
+// The internal view ([Error.AsMap], which may contain PII) is an explicit
+// choice: build the error with [WithJSONOutputAsUnsafe] or
+// [WithGeneralOutputAsUnsafe], or encode [Error.AsMap] yourself.
 func (e Error) MarshalJSON() ([]byte, error) {
-	return json.Marshal(e.AsMap())
+	if e.unsafeJSON || e.unsafeOutput {
+		return json.Marshal(e.AsMap())
+	}
+	return json.Marshal(e.SafeMap())
 }

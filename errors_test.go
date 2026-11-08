@@ -1,9 +1,12 @@
 package errors
 
 import (
+	"bytes"
+	"encoding/json"
 	nerrors "errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -115,20 +118,103 @@ func TestAsMap_WithStandardError(t *testing.T) {
 	assert.Equal(t, "standard error", errMap["originalError"])
 }
 
-func TestMarshalJSON(t *testing.T) {
-	err := New("JSON error", WithAdditionalData(map[string]any{"code": 404}))
+func TestMarshalJSON_SafeByDefault(t *testing.T) {
+	err := New("JSON error",
+		WithAdditionalData(map[string]any{"ssn": "123-45-6789"}), // unsafe
+		WithSafeData(map[string]any{"code": "E1"}),               // safe
+	)
 
 	jsonBytes, marshalErr := err.MarshalJSON()
 	assert.NoError(t, marshalErr)
 	assert.Contains(t, string(jsonBytes), "JSON error")
-	assert.Contains(t, string(jsonBytes), "404")
+	assert.Contains(t, string(jsonBytes), "E1")
+	assert.NotContains(t, string(jsonBytes), "123-45-6789") // unsafe data excluded by default
 }
 
-func TestMarshalJSON_FormatsLateParsedMessage(t *testing.T) {
-	err := New("user %s", WithParsedMessage("bob"))
-	raw, marshalErr := err.MarshalJSON()
+func TestMarshalJSON_EncodingJSONUsesSafeView(t *testing.T) {
+	err := New("boom", WithAdditionalData(map[string]any{"ssn": "123-45-6789"}))
+
+	// The implicit path: json.Marshal calls MarshalJSON.
+	jsonBytes, marshalErr := json.Marshal(err)
 	assert.NoError(t, marshalErr)
-	assert.Contains(t, string(raw), `"message":"user bob"`)
+	assert.NotContains(t, string(jsonBytes), "123-45-6789")
+}
+
+func TestMarshalJSON_SlogJSONHandlerUsesSafeView(t *testing.T) {
+	err := New("boom", WithAdditionalData(map[string]any{"ssn": "123-45-6789"}))
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	logger.Error("request failed", slog.Any("err", err))
+
+	assert.NotContains(t, buf.String(), "123-45-6789")
+	assert.Contains(t, buf.String(), "boom")
+}
+
+func TestWithJSONOutputAsUnsafe(t *testing.T) {
+	err := New("boom",
+		WithAdditionalData(map[string]any{"ssn": "123-45-6789"}),
+		WithJSONOutputAsUnsafe(),
+	)
+
+	jsonBytes, marshalErr := err.MarshalJSON()
+	assert.NoError(t, marshalErr)
+	assert.Contains(t, string(jsonBytes), "123-45-6789") // explicit opt-out
+}
+
+func TestWithGeneralOutputAsUnsafe(t *testing.T) {
+	err := New("boom",
+		WithAdditionalData(map[string]any{"ssn": "123-45-6789"}),
+		WithGeneralOutputAsUnsafe(),
+	)
+
+	jsonBytes, marshalErr := err.MarshalJSON()
+	assert.NoError(t, marshalErr)
+	assert.Contains(t, string(jsonBytes), "123-45-6789")
+}
+
+func TestUnsafeOutput_ScopedToOneParse(t *testing.T) {
+	sentinel := New("boom", WithAdditionalData(map[string]any{"ssn": "123-45-6789"}))
+
+	once := sentinel.Parse(WithJSONOutputAsUnsafe())
+	onceBytes, _ := once.(*Error).MarshalJSON()
+	assert.Contains(t, string(onceBytes), "123-45-6789") // this occurrence opted out
+
+	sentinelBytes, _ := sentinel.MarshalJSON()
+	assert.NotContains(t, string(sentinelBytes), "123-45-6789") // sentinel stays safe
+}
+
+func TestUnsafeOutput_SurvivesParse(t *testing.T) {
+	// A sentinel that declared the unsafe knob keeps it through Parse.
+	sentinel := New("boom",
+		WithAdditionalData(map[string]any{"ssn": "123-45-6789"}),
+		WithGeneralOutputAsUnsafe(),
+	)
+	parsed := sentinel.Parse()
+	raw, _ := parsed.(*Error).MarshalJSON()
+	assert.Contains(t, string(raw), "123-45-6789")
+}
+
+func TestUnsafeJSONOutput_SurvivesParse(t *testing.T) {
+	sentinel := New("boom",
+		WithAdditionalData(map[string]any{"ssn": "123-45-6789"}),
+		WithJSONOutputAsUnsafe(),
+	)
+	parsed := sentinel.Parse()
+	raw, _ := parsed.(*Error).MarshalJSON()
+	assert.Contains(t, string(raw), "123-45-6789")
+}
+
+func TestUnsafeOutput_DoesNotAffectSafeMapOrSafeError(t *testing.T) {
+	err := New("user %s",
+		WithParsedMessage("secret"),
+		WithAdditionalData(map[string]any{"ssn": "123-45-6789"}),
+		WithGeneralOutputAsUnsafe(),
+	)
+
+	assert.NotContains(t, fmt.Sprint(err.SafeMap()), "123-45-6789")
+	assert.NotContains(t, fmt.Sprint(err.SafeMap()), "secret")
+	assert.Equal(t, "user", err.SafeError())
 }
 
 func TestLateParse(t *testing.T) {
@@ -360,6 +446,39 @@ func TestSafeParsedMessage_FewerArgs(t *testing.T) {
 	assert.Equal(t, "error in at", err.SafeError())
 }
 
+func TestWithHTTPStatus(t *testing.T) {
+	err := New("not authorized", WithHTTPStatus(403))
+	assert.Equal(t, 403, err.HTTPStatus())
+}
+
+func TestHTTPStatus_UnsetIsZero(t *testing.T) {
+	err := New("no status")
+	assert.Equal(t, 0, err.HTTPStatus())
+}
+
+func TestWithHTTPStatus_SurvivesParse(t *testing.T) {
+	sentinel := New("forbidden", WithHTTPStatus(403))
+	parsed := sentinel.Parse(WithError(nerrors.New("cause"))).(*Error)
+	assert.Equal(t, 403, parsed.HTTPStatus())
+	// Sentinel unchanged.
+	assert.Equal(t, 403, sentinel.HTTPStatus())
+}
+
+func TestWithHTTPStatus_OverrideAtParse(t *testing.T) {
+	sentinel := New("conflict", WithHTTPStatus(409))
+	parsed := sentinel.Parse(WithHTTPStatus(400)).(*Error)
+	assert.Equal(t, 400, parsed.HTTPStatus())
+	assert.Equal(t, 409, sentinel.HTTPStatus()) // sentinel not mutated
+}
+
+func TestNew_PanicsOnEmptyMessage(t *testing.T) {
+	assert.PanicsWithValue(t, "errors: New called with an empty message", func() { New("") })
+}
+
+func TestNew_PanicsOnWhitespaceMessage(t *testing.T) {
+	assert.Panics(t, func() { New("   \t\n") })
+}
+
 func TestSafeMap_DataCannotShadowMessage(t *testing.T) {
 	err := New("real message",
 		WithSafeData(map[string]any{"message": "impostor"}),
@@ -399,6 +518,25 @@ func TestAsMap_FormatsLateParsedMessage(t *testing.T) {
 	assert.Equal(t, "user bob", err.AsMap()["message"])
 }
 
+func TestMarshalJSON_FormatsLateParsedSafeMessage(t *testing.T) {
+	// Safe by default: the safe message uses WithSafeParsedMessage values.
+	err := New("resource %s in %s",
+		WithParsedMessage("secret-id", "prod"),
+		WithSafeParsedMessage("resource", "prod"),
+	)
+	raw, marshalErr := err.MarshalJSON()
+	assert.NoError(t, marshalErr)
+	assert.Contains(t, string(raw), `"message":"resource resource in prod"`)
+	assert.NotContains(t, string(raw), "secret-id")
+}
+
+func TestMarshalJSON_UnsafeFormatsLateParsedMessage(t *testing.T) {
+	err := New("user %s", WithParsedMessage("bob"), WithJSONOutputAsUnsafe())
+	raw, marshalErr := err.MarshalJSON()
+	assert.NoError(t, marshalErr)
+	assert.Contains(t, string(raw), `"message":"user bob"`)
+}
+
 // --- sentinel immutability, field by field ---
 
 func TestParse_DoesNotMutateSentinelData(t *testing.T) {
@@ -406,18 +544,21 @@ func TestParse_DoesNotMutateSentinelData(t *testing.T) {
 		WithSafeData(map[string]any{"s": 1}),
 		WithAdditionalData(map[string]any{"a": 1}),
 		WithError(nerrors.New("cause")),
+		WithHTTPStatus(409),
 	)
 
 	_ = sentinel.Parse(
 		WithSafeData(map[string]any{"leak": "x"}),
 		WithAdditionalData(map[string]any{"leak": "x"}),
 		WithError(nerrors.New("extra")),
+		WithHTTPStatus(400),
 		WithParsedMessage("v"),
 	)
 
 	assert.NotContains(t, sentinel.SafeMap(), "leak")
 	assert.NotContains(t, sentinel.AsMap(), "leak")
 	assert.Len(t, sentinel.Originals(), 1)
+	assert.Equal(t, 409, sentinel.HTTPStatus())
 	assert.Equal(t, "sentinel %s", sentinel.Error())
 }
 
@@ -620,6 +761,24 @@ func TestWithParsedMessage_MalformedFormattingKeepsTemplate(t *testing.T) {
 }
 
 // --- stdlib re-exports ---
+
+func TestStdlibReExports(t *testing.T) {
+	cause := nerrors.New("cause")
+	wrapped := fmt.Errorf("outer: %w", cause)
+
+	assert.Equal(t, cause, Unwrap(wrapped))
+	assert.True(t, Is(Join(nerrors.New("a"), cause), cause))
+	assert.Equal(t, nerrors.ErrUnsupported, ErrUnsupported)
+
+	native := New("native")
+	var nativeErr error = native
+	found, ok := AsType[*Error](fmt.Errorf("ctx: %w", nativeErr))
+	assert.True(t, ok)
+	assert.Same(t, native, found)
+
+	_, ok = AsType[*Error](cause)
+	assert.False(t, ok)
+}
 
 func TestAsMap_ReservedKeysCannotBeFakedWhenAbsent(t *testing.T) {
 	// No cause and no stack: the error must not claim either through data.

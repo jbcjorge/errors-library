@@ -22,3 +22,14 @@ func Unwrap(err error) error { return nerrors.Unwrap(err) }
 // each message.
 // This is a re-export of [errors.Join] from the standard library.
 func Join(errs ...error) error { return nerrors.Join(errs...) }
+
+// AsType finds the first error in err's tree that matches the type T, and if
+// one is found, returns that error value and true. Otherwise it returns the
+// zero value of T and false.
+// This is a re-export of [errors.AsType] from the standard library.
+func AsType[T error](err error) (T, bool) { return nerrors.AsType[T](err) }
+
+// ErrUnsupported indicates that a requested operation cannot be performed,
+// because it is unsupported.
+// This is a re-export of [errors.ErrUnsupported] from the standard library.
+var ErrUnsupported = nerrors.ErrUnsupported
