@@ -41,7 +41,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Find the release notes
+        id: notes
+        run: |
+          file=".github/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$file" ]; then
+            echo "Using the hand written notes in $file"
+            echo "file=$file" >> "$GITHUB_OUTPUT"
+          else
+            echo "No notes file at $file, using the generated notes only"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
+          # The hand written notes (when the file exists) come first and the
+          # generated changelog is appended after them.
+          body_path: ${{ steps.notes.outputs.file }}
           generate_release_notes: true
