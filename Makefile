@@ -32,14 +32,32 @@ update-tools:
 	go install gotest.tools/gotestsum@latest
 	go install github.com/go-gremlins/gremlins/cmd/gremlins@latest
 
-## update-deps: Upgrade direct module dependencies and the Go directive, then verify
+## update-deps: Upgrade direct module dependencies, then verify (UPGRADE_GO=1 also raises the go directive)
+#
+# The go directive is the minimum Go version every consumer of the library
+# needs, so it is left alone unless you ask for it:
+#
+#   make update-deps               upgrade dependencies only
+#   make update-deps UPGRADE_GO=1  also raise the go directive to the latest Go
+#
+# A dependency can require a newer Go than the directive and make `go get`
+# raise it anyway; the target warns when that happens without UPGRADE_GO.
 update-deps:
-	@go list -m -f '{{if not .Indirect}}{{.Path}}{{end}}' all | grep -v '^$(MODULE)$$' | xargs -I{} go get {}@latest
-	go get go@latest
-	go mod tidy
-	go build ./...
-	go test -race -count=1 ./...
-	@echo "Dependencies updated and verified. Review go.mod, then re-pin tools with 'make update-tools'."
+	@set -e; \
+	before=$$(go list -m -f '{{.GoVersion}}'); \
+	echo "==> upgrading direct dependencies"; \
+	go list -m -f '{{if not .Indirect}}{{.Path}}{{end}}' all | grep -v '^$(MODULE)$$' | xargs -I{} go get {}@latest; \
+	if [ -n "$(UPGRADE_GO)" ]; then echo "==> raising the go directive (UPGRADE_GO is set)"; go get go@latest; fi; \
+	go mod tidy; \
+	after=$$(go list -m -f '{{.GoVersion}}'); \
+	if [ "$$before" != "$$after" ] && [ -z "$(UPGRADE_GO)" ]; then \
+		echo "WARNING: a dependency raised the go directive from $$before to $$after."; \
+		echo "         Every consumer now needs Go $$after or newer. Revert go.mod and go.sum to keep $$before."; \
+	fi; \
+	echo "==> verifying (go directive: $$after)"; \
+	go build ./...; \
+	go test -race -count=1 ./...; \
+	echo "Dependencies updated and verified. Review go.mod, then re-pin tools with 'make update-tools'."
 
 ## fmt: Format code
 fmt:
