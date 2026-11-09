@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -961,4 +962,111 @@ func TestSafeMap_MultiCauseChainIsTruncatedAtTheDepthBound(t *testing.T) {
 	top := err.(*Error)
 
 	assert.Equal(t, maxMapDepth, multiChainDepth(top.SafeMap()))
+}
+
+// --- late-parsed options run on a private copy ---
+
+// tenantLate is a late option the way a client writes one: it reaches the error
+// only through the exported AddOptions, which writes into the error's data maps.
+func tenantLate(name string) StoredError {
+	return LateParse("clientTenant", func(e *Error) {
+		e.AddOptions(WithSafeData(map[string]any{"tenant": name}))
+	})
+}
+
+func TestLateOption_ConcurrentReadsDoNotRace(t *testing.T) {
+	// Run with -race (make test does). Before late options ran on a private
+	// copy, this wrote into the data maps shared by every reader.
+	err := New("late %s", WithParsedMessage("x"), tenantLate("acme"))
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = err.Error()
+			_ = err.SafeError()
+			_ = err.SafeMap()
+			_ = err.AsMap()
+			_, _ = err.MarshalJSON()
+		}()
+	}
+	wg.Wait()
+}
+
+func TestLateOption_DoesNotChangeTheDeclaredError(t *testing.T) {
+	err := New("late", tenantLate("acme"))
+
+	_ = err.SafeMap()
+	_ = err.AsMap()
+	_ = err.Error()
+
+	assert.NotContains(t, err.safeData, "tenant", "reading must not write into the error")
+	assert.Len(t, err.options, 1)
+}
+
+func TestLateOption_DataAppearsInEveryRenderedView(t *testing.T) {
+	err := New("late", tenantLate("acme"))
+
+	assert.Equal(t, "acme", err.SafeMap()["tenant"])
+	assert.Equal(t, "acme", err.AsMap()["tenant"])
+	raw, marshalErr := err.MarshalJSON()
+	assert.NoError(t, marshalErr)
+	assert.Contains(t, string(raw), `"tenant":"acme"`)
+}
+
+func TestLateOption_SurvivesParseAndStaysPerOccurrence(t *testing.T) {
+	sentinel := New("late", tenantLate("acme"))
+
+	assert.Equal(t, "acme", sentinel.Parse().(*Error).SafeMap()["tenant"])
+	assert.NotContains(t, sentinel.safeData, "tenant")
+}
+
+func TestLateOptions_RunInAFixedOrder(t *testing.T) {
+	appendTo := func(name ErrorType, suffix string) StoredError {
+		return LateParse(name, func(e *Error) { e.parsedMessage += suffix })
+	}
+	// Registered out of order on purpose: they must run sorted by type name.
+	err := New("base", appendTo("c", "C"), appendTo("a", "A"), appendTo("b", "B"))
+
+	for range 50 {
+		assert.Equal(t, "baseABC", err.Error())
+	}
+}
+
+func TestLateOption_AddingALateOptionDoesNotRunItInTheSamePass(t *testing.T) {
+	inner := LateParse("inner", func(e *Error) { e.parsedMessage += "-inner" })
+	outer := LateParse("outer", func(e *Error) {
+		e.parsedMessage += "-outer"
+		e.AddOptions(inner)
+	})
+	err := New("base", outer)
+
+	assert.Equal(t, "base-outer", err.Error())
+	assert.Equal(t, "base-outer", err.Error(), "the added option must not accumulate across reads")
+	assert.NotContains(t, err.options, ErrorType("inner"))
+}
+
+func TestLateOption_SameTypeReplacesTheEarlierOne(t *testing.T) {
+	first := LateParse("same", func(e *Error) { e.parsedMessage += "-first" })
+	second := LateParse("same", func(e *Error) { e.parsedMessage += "-second" })
+
+	assert.Equal(t, "base-second", New("base", first, second).Error())
+}
+
+func TestOriginal_AppliesLateOptionsToTheReturnedValue(t *testing.T) {
+	err := New("user %s", WithParsedMessage("bob"))
+
+	original, ok := err.Original().(Error)
+	assert.True(t, ok)
+	assert.Equal(t, "user bob", original.parsedMessage)
+}
+
+func TestResolved_ZeroValueErrorIsSafe(t *testing.T) {
+	assert.NotPanics(t, func() {
+		var zero Error
+		_ = zero.resolved()
+		_ = zero.SafeMap()
+		_ = zero.AsMap()
+	})
 }

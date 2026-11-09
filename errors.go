@@ -7,6 +7,7 @@ import (
 	"maps"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 )
 
@@ -37,11 +38,31 @@ func New(message string, opts ...StoredError) *Error {
 	return err
 }
 
-// parse executes all late-parsed options, filling in deferred format arguments.
-func (e *Error) parse() {
-	for _, opt := range e.options {
-		opt(e)
+// resolved returns a view of the error with every late-parsed option applied.
+//
+// The options run on a private copy of the error, never on the receiver, so a
+// late option cannot race with concurrent readers of a shared error and cannot
+// leave state behind on it: every read starts from the same declared error.
+// They run in a fixed order (sorted by option type), so the result does not
+// depend on map iteration order, and from a snapshot, so a late option that
+// adds another late option does not run it in the same pass.
+//
+// An error without late options is returned as is, at no extra cost.
+func (e Error) resolved() Error {
+	if len(e.options) == 0 {
+		return e
 	}
+	names := make([]ErrorType, 0, len(e.options))
+	for name := range e.options {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	view := e.clone()
+	for _, name := range names {
+		e.options[name](view)
+	}
+	return *view
 }
 
 // AddOptions applies the given options to the error. Immediate-parse options
@@ -101,11 +122,10 @@ func (e *Error) clone() *Error {
 	}
 }
 
-// Error implements the [error] interface. It triggers late-parsed options
-// before returning the fully rendered message string.
+// Error implements the [error] interface. It applies the late-parsed options
+// and returns the fully rendered message string.
 func (e Error) Error() string {
-	e.parse()
-	return e.parsedMessage
+	return e.resolved().parsedMessage
 }
 
 // SafeError returns a PII-free version of the error message. If
@@ -113,20 +133,19 @@ func (e Error) Error() string {
 // Otherwise, it strips format placeholders from the template
 // (e.g., "user %s not found" becomes "user not found").
 func (e Error) SafeError() string {
-	e.parse()
-	if e.safeMessage != "" {
-		return e.safeMessage
+	view := e.resolved()
+	if view.safeMessage != "" {
+		return view.safeMessage
 	}
-	return sanitizeTemplate(e.message)
+	return sanitizeTemplate(view.message)
 }
 
 // Original returns the first wrapped original error, or, if no original errors
-// were set, a copy of the receiver as an [Error] value (not a pointer).
-// Late-parsed options are triggered before the check.
+// were set, a copy of the receiver as an [Error] value (not a pointer) with the
+// late-parsed options applied.
 func (e Error) Original() error {
 	if len(e.originals) == 0 {
-		e.parse()
-		return e
+		return e.resolved()
 	}
 	return e.originals[0]
 }
@@ -187,7 +206,7 @@ func (e Error) AsMap() map[string]any {
 }
 
 func (e Error) asMap(depth int, budget *int) map[string]any {
-	e.parse()
+	e = e.resolved()
 	temporaryMap := map[string]any{}
 	maps.Copy(temporaryMap, e.safeData)
 	maps.Copy(temporaryMap, e.additionalData)
@@ -258,7 +277,7 @@ func spendNode(budget *int) bool {
 }
 
 func (e Error) safeMap(depth int, budget *int) map[string]any {
-	e.parse()
+	e = e.resolved()
 	msg := sanitizeTemplate(e.message)
 	if e.safeMessage != "" {
 		msg = e.safeMessage
