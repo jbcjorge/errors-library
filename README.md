@@ -53,6 +53,30 @@ errors.Is(err, ErrNotFound) // true
 - **`New` panics on an empty message**, so a broken sentinel fails at program startup. Do not build messages from runtime values that may be empty, such as `New(err.Error())`.
 - **Wrapped errors are followed to a depth of 64, and at most 1000 are visited** by `AsMap` and `SafeMap`. This only matters if an error wraps itself (directly or through others); the deeper causes are then omitted instead of crashing or hanging.
 
+### Custom options
+
+The built-in `With...` options cover most needs. To define your own, use `ImmediateParse`, most often to bundle built-in options that always travel together:
+
+```go
+// NotFound declares what every "not found" error of a service has in common.
+func NotFound(resource string) errors.StoredError {
+    return errors.ImmediateParse("notFound", func(e *errors.Error) {
+        e.AddOptions(
+            errors.WithHTTPStatus(http.StatusNotFound),
+            errors.WithSafeData(map[string]any{"resource": resource}),
+        )
+    })
+}
+
+var ErrKeyMissing = errors.New("key not found", NotFound("key"))
+
+return ErrKeyMissing.Parse(errors.WithError(cause)) // status 404 and resource "key" come along
+```
+
+The fields of `Error` are private, so a custom option works through its exported methods, above all `AddOptions`. Like every option, it can be passed to `New` to declare something once, or to `Parse` to apply it to a single occurrence.
+
+`LateParse` is for the rare option that must be worked out every time the error is read, such as data computed lazily. It is how `WithParsedMessage` works. A late option runs on a private copy of the error each time you call `Error()`, `SafeError()`, `SafeMap()`, `AsMap()`, `MarshalJSON()` or `Original()`, so it never changes the error and is safe to read from many goroutines. It does not affect `HTTPStatus()`, `Originals()`, `Unwrap()` or `Is()`, and it must be deterministic and cheap. Late options run in order of their name; adding a second one with the same name replaces the first.
+
 ## Network portability (gRPC / cross-service errors)
 
 This library is **not intended for sharing errors across service boundaries**.
@@ -183,6 +207,16 @@ make check   # fmt check, vet, shadow, staticcheck, govulncheck, gosec, gitleaks
 make fmt     # format the code
 ```
 
+Keeping things up to date:
+
+```bash
+make update-deps               # upgrade direct dependencies, then build and test
+make update-deps UPGRADE_GO=1  # also raise the go directive to the latest Go
+make update-tools              # install the latest dev tools; re-pin them in the Makefile afterwards
+```
+
+The `go` directive in `go.mod` is the minimum Go version every consumer needs, so `update-deps` leaves it alone unless you pass `UPGRADE_GO=1`. If an upgraded dependency forces it up anyway, the target prints a warning with the old and new versions.
+
 `make check` also needs `gitleaks` on the PATH. Test and coverage reports are
 written to `reports/`.
 
@@ -194,9 +228,10 @@ options.go      # Functional options (WithError, WithParsedMessage, etc.)
 types.go        # Type definitions (StoredError, ErrorType, Error struct)
 constants.go    # ErrorType constants
 stdlib.go       # Re-exports of standard library functions (Is, As, AsType, Unwrap, Join, ErrUnsupported)
-stored.go       # LateParse / ImmediateParse constructors
+stored.go       # ImmediateParse / LateParse: define your own options
 doc.go          # Package documentation
 errors_test.go  # Tests for the core package
+extension_test.go # Tests that define custom options from outside the package
 httperr/
   httperr.go    # Package documentation and the Write error sentinels
   writer.go     # Writer: Write, Fallback, payload resolution
@@ -217,6 +252,7 @@ Read this before upgrading from v0.1.1:
 - The keys `message`, `stackTrace`, `originalError` and `originalErrors` are reserved. Data with these keys, passed through `WithSafeData` or `WithAdditionalData`, is ignored. Before, a data key named `message` replaced the real message.
 - `SafeError()` and `SafeMap()` turn an escaped percent sign (`%%`) into a single `%`; before, part of the following word was removed (`100%% sure` became `100%ure`).
 - `WithError(nil)` and `WithErrors(...)` ignore nil errors; before, a nil cause caused a panic later.
+- Late-parsed options (`WithParsedMessage` and custom `LateParse` options) now run on a private copy of the error, in order of their name. Before, they ran on a copy that shared its data maps with the original, so a custom late option that wrote data raced under concurrent reads.
 - `StackTrace()` returns nil for an error without a captured stack.
 - New: `WithHTTPStatus`, `Error.HTTPStatus`, the `httperr` subpackage, and the `AsType` and `ErrUnsupported` re-exports.
 

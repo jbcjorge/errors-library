@@ -1,8 +1,10 @@
 package errors
 
-// StoredError pairs an [ErrorOption] function with metadata controlling when
-// it is applied. When lateParse is true the option is deferred until the error
-// message is rendered; otherwise it runs immediately at construction time.
+// StoredError is an option that can be added to an [Error]. The built-in ones
+// are created by functions such as [WithError] and [WithSafeData]; your own are
+// created with [ImmediateParse] and [LateParse]. When lateParse is true the
+// option is deferred until the error is read; otherwise it runs immediately
+// when it is added.
 type StoredError struct {
 	lateParse bool
 	errorFunc ErrorOption
@@ -35,6 +37,10 @@ type Error struct {
 	unsafeOutput bool
 }
 
-// ErrorOption is a function that mutates an [Error] to apply additional
-// context such as a wrapped error, formatted message, or extra data.
+// ErrorOption is a function that applies additional context to an [Error], such
+// as a wrapped error, formatted message, or extra data. The fields of Error are
+// not accessible outside this package, so an option written elsewhere works
+// through the exported methods, above all [Error.AddOptions]. Turn one into an
+// option with [ImmediateParse] (applied when added) or [LateParse] (applied on
+// every read).
 type ErrorOption func(*Error)

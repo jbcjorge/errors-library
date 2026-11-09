@@ -18,6 +18,13 @@
 // [As], [AsType], [Unwrap], [Join], [ErrUnsupported]) so it can serve as a
 // single import replacing the standard "errors" package.
 //
+// # Custom options
+//
+// Reusable options of your own are defined with [ImmediateParse], usually by
+// bundling the built-in options through [Error.AddOptions]. [LateParse] is for
+// the rare option that must be worked out each time the error is read; it runs
+// on a private copy of the error, so it never changes the error itself.
+//
 // # HTTP status codes
 //
 // An [Error] can carry an HTTP status code via [WithHTTPStatus]. The code is
